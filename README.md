@@ -1,4 +1,5 @@
-<img width="2559" height="1400" alt="Screenshot_156" src="https://github.com/user-attachments/assets/70c883c2-fbfc-45b5-98d2-6d98ad956990" />
+<img width="2559" height="1402" alt="Screenshot_158" src="https://github.com/user-attachments/assets/2a4db9b0-1edd-4240-86f6-7d328910eff6" />
+
 # krendtrademonitor
 
 Десктоп-монитор торгового бота **krendeltrader** (Qt 5.12, C++17). Тот же инструментарий и стиль,
