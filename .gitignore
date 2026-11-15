@@ -1,0 +1,4 @@
+build-rel/
+build-*/
+# в trademonitor.json лежит токен сервера
+trademonitor.json
