@@ -32,10 +32,14 @@ namespace Trade {
         AdviceEditor(QWidget* parent, QtInterface::ApiClient* api, const QString& name, bool isNew);
 
         QString                 GetName() const;
+        //! \brief В окне есть несохранённые правки.
+        bool                    IsModified() const;
 
     signals:
         //! \brief Файл сохранён на сервере (списку пора обновиться).
         void Saved(const QString& name);
+        //! \brief Новый файл переименован перед сохранением (сервер не принял прежнее имя).
+        void Renamed(const QString& oldName, const QString& newName);
 
     protected:
         bool                    InitForChild() override;
@@ -45,6 +49,8 @@ namespace Trade {
     private:
         void                    Load();
         void                    Save(bool force);
+        //! \brief Спросить другое имя для нового файла. \return true — имя сменилось.
+        bool                    AskNewName(const QString& reason);
         void                    SetModified(bool modified);
         void                    SetStatus(const QString& text, const QColor& color);
 

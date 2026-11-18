@@ -2,13 +2,21 @@
 
 #include "QtInterface/style/theme.h"
 
+#include <QColorDialog>
+#include <QComboBox>
 #include <QDateTime>
+#include <QMenu>
+#include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
+#include <QPushButton>
+#include <QSignalBlocker>
+#include <QToolTip>
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 using namespace QtInterface;
 
@@ -19,6 +27,16 @@ namespace {
     const int kAxisBottom = 22;     //!< \brief высота оси времени
     const int kPadTop     = 8;
     const int kPadLeft    = 6;
+
+    const int kZoomButton    = 30;      //!< \brief сторона кнопки «−» / «+»
+    const int kZoomGap       = 4;       //!< \brief отступ кнопок от края области свечей и между ними
+    const int kSetBoxWidth   = 150;     //!< \brief ширина списка наборов векторов
+    const int kWidthBoxWidth = 64;      //!< \brief ширина списка толщин
+    const int kVectorWidths[] = { 1, 2, 3, 4, 6 };     //!< \brief толщины векторов, px
+    const char* const kNewSetItem = "\x01new";  //!< \brief data пункта «Новый набор…» (имя файла таким не бывает)
+    const double kLiqMaxLength = 0.3;   //!< \brief черточка самого крупного уровня — доля ширины графика
+    const double kLiqMinShare  = 0.01;  //!< \brief уровни мельче этой доли от крупнейшего не рисуются
+    const double kMinVectorPx = 4;      //!< \brief короче — второй клик считается промахом, не концом вектора
 
     //! \brief «Красивый» шаг сетки (1, 2, 5 × 10^k), чтобы делений было около target.
     double NiceStep(double span, int target)
@@ -32,6 +50,31 @@ namespace {
     }
 
     QDateTime FromTs(double ts) { return QDateTime::fromMSecsSinceEpoch(static_cast<qint64>(ts * 1000)); }
+
+    //! \brief $7 600 000 → «$7.6 млн».
+    QString FormatUsd(double usd)
+    {
+        const double a = std::fabs(usd);
+        if(a >= 1e9) return QString("$%1 млрд").arg(usd / 1e9, 0, 'f', 2);
+        if(a >= 1e6) return QString("$%1 млн").arg(usd / 1e6, 0, 'f', a >= 1e8 ? 0 : 1);
+        if(a >= 1e3) return QString("$%1 тыс").arg(usd / 1e3, 0, 'f', 0);
+        return QString("$%1").arg(usd, 0, 'f', 0);
+    }
+
+    /*!
+     *  \brief Конец луча из a через b: где он выходит за rect (не ближе b).
+     *  Луч рисуется до края области свечей, а не до точки второго клика.
+     */
+    QPointF RayEnd(const QPointF& a, const QPointF& b, const QRectF& rect)
+    {
+        const QPointF d = b - a;
+        if(std::hypot(d.x(), d.y()) < 1e-9) return b;
+        const double inf = std::numeric_limits<double>::infinity();
+        // по каждой оси — при каком t луч доходит до края в сторону движения
+        const double tx = d.x() > 0 ? (rect.right() - a.x()) / d.x() : d.x() < 0 ? (rect.left() - a.x()) / d.x() : inf;
+        const double ty = d.y() > 0 ? (rect.bottom() - a.y()) / d.y() : d.y() < 0 ? (rect.top() - a.y()) / d.y() : inf;
+        return a + d * std::max(1.0, std::min(tx, ty));
+    }
 }
 
 struct CandleChart::Frame {
@@ -49,8 +92,24 @@ struct CandleChart::Frame {
 CandleChart::CandleChart(QWidget* parent)
     : BaseWidget(parent)
     , intervalSec(60)
+    , windowSize(0)
     , livePrice(0)
     , isMouseInside(false)
+    , zoomOutButton(nullptr)
+    , zoomInButton(nullptr)
+    , rulerButton(nullptr)
+    , vectorSetBox(nullptr)
+    , hasVectorStart(false)
+    , startTs(0)
+    , startPrice(0)
+    , colorButton(nullptr)
+    , widthBox(nullptr)
+    , newVectorColor("#3d8bfd")
+    , hoverVector(-1)
+    , liqButton(nullptr)
+    , liqStep(0)
+    , liqMaxUsd(0)
+    , hoverLiquidation(-1)
 {
 }
 
@@ -58,7 +117,283 @@ bool CandleChart::InitForChild()
 {
     setMouseTracking(true);
     setMinimumSize(320, 200);
+
+    zoomOutButton = new QPushButton("−", this);
+    zoomInButton  = new QPushButton("+", this);
+    for(QPushButton* b : { zoomOutButton, zoomInButton }) {
+        b->setFixedSize(kZoomButton, kZoomButton);
+        b->setCursor(Qt::PointingHandCursor);
+        b->setFocusPolicy(Qt::NoFocus);
+        b->setAutoRepeat(true);             // зажал — масштаб меняется дальше
+        b->setAutoRepeatDelay(400);
+        b->setAutoRepeatInterval(150);
+        b->installEventFilter(this);        // курсор над кнопкой — перекрестие убрать
+        b->raise();                         // поверх остальных детей графика
+    }
+    connect(zoomOutButton, &QPushButton::clicked, this, [this]() { emit ZoomRequested(false); });
+    connect(zoomInButton,  &QPushButton::clicked, this, [this]() { emit ZoomRequested(true); });
+
+    rulerButton = new QPushButton(this);
+    rulerButton->setFixedSize(kZoomButton, kZoomButton);
+    rulerButton->setCursor(Qt::PointingHandCursor);
+    rulerButton->setFocusPolicy(Qt::NoFocus);
+    rulerButton->setCheckable(true);
+    rulerButton->setIconSize(QSize(20, 20));
+    rulerButton->setToolTip("Нарисовать вектор: клик — начало, второй клик — конец\n"
+                            "Esc или правый клик — отмена");
+    rulerButton->installEventFilter(this);
+    connect(rulerButton, &QPushButton::toggled, this, &CandleChart::SetRulerActive);
+
+    vectorSetBox = new QComboBox(this);
+    vectorSetBox->setFixedSize(kSetBoxWidth, kZoomButton);
+    vectorSetBox->setFocusPolicy(Qt::NoFocus);
+    vectorSetBox->setToolTip("Набор векторов: что показывать на графике и куда сохранять новые");
+    vectorSetBox->installEventFilter(this);
+    connect(vectorSetBox, QOverload<int>::of(&QComboBox::activated), this, [this](int index) {
+        const QString data = vectorSetBox->itemData(index).toString();
+        if(data == kNewSetItem) {
+            // вернуть список к прежнему набору: новый появится, когда владелец его создаст
+            const QSignalBlocker block(vectorSetBox);
+            vectorSetBox->setCurrentIndex(vectorSetBox->property("current").toInt());
+            emit NewVectorSetRequested();
+            return;
+        }
+        vectorSetBox->setProperty("current", index);
+        emit VectorSetSelected(data);
+    });
+
+    colorButton = new QPushButton(this);
+    colorButton->setFixedSize(kZoomButton, kZoomButton);
+    colorButton->setCursor(Qt::PointingHandCursor);
+    colorButton->setFocusPolicy(Qt::NoFocus);
+    colorButton->setIconSize(QSize(18, 18));
+    colorButton->setToolTip("Цвет новых векторов");
+    colorButton->installEventFilter(this);
+    connect(colorButton, &QPushButton::clicked, this, [this]() {
+        const QColor c = QColorDialog::getColor(newVectorColor, this, "Цвет новых векторов");
+        if(!c.isValid()) return;
+        SetNewVectorStyle(c, GetNewVectorWidth());
+        emit NewVectorStyleChanged(newVectorColor, GetNewVectorWidth());
+    });
+
+    widthBox = new QComboBox(this);
+    widthBox->setFixedSize(kWidthBoxWidth, kZoomButton);
+    widthBox->setFocusPolicy(Qt::NoFocus);
+    widthBox->setToolTip("Толщина новых векторов");
+    widthBox->installEventFilter(this);
+    for(int w : kVectorWidths) widthBox->addItem(QString("%1 px").arg(w), w);
+    widthBox->setCurrentIndex(widthBox->findData(2));
+
+    // «череп» — выключатель карты ликвидаций: нажат — красный, на графике черточки
+    liqButton = new QPushButton(QString(QChar(0x2620)), this);
+    liqButton->setObjectName("liqButton");
+    liqButton->setFixedSize(kZoomButton, kZoomButton);
+    liqButton->setCursor(Qt::PointingHandCursor);
+    liqButton->setFocusPolicy(Qt::NoFocus);
+    liqButton->setCheckable(true);
+    liqButton->installEventFilter(this);
+    connect(liqButton, &QPushButton::toggled, this, [this](bool active) {
+        hoverLiquidation = -1;
+        UpdateLiquidationButtonTip();
+        update();
+        emit LiquidationsToggled(active);
+    });
+    UpdateLiquidationButtonTip();
+    connect(widthBox, QOverload<int>::of(&QComboBox::activated), this, [this](int) {
+        emit NewVectorStyleChanged(newVectorColor, GetNewVectorWidth());
+    });
+
+    setFocusPolicy(Qt::ClickFocus);         // Esc отменяет начатый вектор
+    UpdateRulerIcon();
+    UpdateColorButton();
     return true;
+}
+
+void CandleChart::SetNewVectorStyle(const QColor& color, double width)
+{
+    if(color.isValid()) newVectorColor = color;
+    if(widthBox) {
+        int best = 0;       // ближайшая толщина из списка
+        for(int i = 1; i < widthBox->count(); ++i)
+            if(std::fabs(widthBox->itemData(i).toDouble() - width) < std::fabs(widthBox->itemData(best).toDouble() - width))
+                best = i;
+        widthBox->setCurrentIndex(best);
+    }
+    UpdateColorButton();
+}
+
+QColor CandleChart::GetNewVectorColor() const { return newVectorColor; }
+
+double CandleChart::GetNewVectorWidth() const { return widthBox ? widthBox->currentData().toDouble() : 2; }
+
+void CandleChart::UpdateColorButton()
+{
+    if(!colorButton) return;
+    const qreal dpr = colorButton->devicePixelRatioF();
+    QPixmap pix(QSize(18, 18) * dpr);
+    pix.setDevicePixelRatio(dpr);
+    pix.fill(Qt::transparent);
+    QPainter p(&pix);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    p.setPen(QPen(colorText.isValid() ? colorText : QColor(Qt::black), 1));
+    p.setBrush(newVectorColor);
+    p.drawRoundedRect(QRectF(1.5, 1.5, 15, 15), 3, 3);
+    p.end();
+    colorButton->setIcon(QIcon(pix));
+    colorButton->setToolTip("Цвет новых векторов: " + newVectorColor.name());
+}
+
+int CandleChart::VectorAt(const QPoint& pos) const
+{
+    Frame f;
+    if(lVectors.isEmpty() || !MakeFrame(f) || !f.plot.contains(pos)) return -1;
+    for(int i = lVectors.size() - 1; i >= 0; --i) {
+        const ChartVector& v = lVectors[i];
+        const QPointF a(f.X(v.t1), f.Y(v.p1));
+        const QPointF b = RayEnd(a, QPointF(f.X(v.t2), f.Y(v.p2)), f.plot);
+        // расстояние от точки до отрезка ab (луч, обрезанный краем графика)
+        const QPointF ab = b - a, ap = QPointF(pos) - a;
+        const double len2 = QPointF::dotProduct(ab, ab);
+        const double t = len2 > 0 ? std::clamp(QPointF::dotProduct(ap, ab) / len2, 0.0, 1.0) : 0.0;
+        const QPointF d = QPointF(pos) - (a + ab * t);
+        if(std::hypot(d.x(), d.y()) <= std::max(5.0, v.width / 2 + 3)) return i;
+    }
+    return -1;
+}
+
+void CandleChart::ShowVectorMenu(int index, const QPoint& globalPos)
+{
+    if(index < 0 || index >= lVectors.size()) return;
+    const ChartVector v = lVectors[index];      // копия: меню модальное, список могут обновить
+    QMenu menu(this);
+    QAction* colorAction = menu.addAction("Цвет…");
+    QMenu* widthMenu = menu.addMenu("Толщина");
+    for(int w : kVectorWidths) {
+        QAction* a = widthMenu->addAction(QString("%1 px").arg(w));
+        a->setCheckable(true);
+        a->setChecked(std::fabs(v.width - w) < 0.01);
+        a->setData(w);
+    }
+    menu.addSeparator();
+    QAction* deleteAction = menu.addAction("Удалить");
+
+    QAction* chosen = menu.exec(globalPos);
+    hoverVector = -1;
+    update();
+    if(!chosen) return;
+    if(chosen == deleteAction) {
+        emit VectorDeleteRequested(v.id);
+        return;
+    }
+    ChartVector changed = v;
+    if(chosen == colorAction) {
+        const QColor c = QColorDialog::getColor(v.color, this, "Цвет вектора");
+        if(!c.isValid() || c == v.color) return;
+        changed.color = c;
+    } else if(chosen->data().isValid()) {
+        changed.width = chosen->data().toDouble();
+        if(std::fabs(changed.width - v.width) < 0.01) return;
+    }
+    emit VectorChanged(changed);
+}
+
+void CandleChart::resizeEvent(QResizeEvent* event)
+{
+    BaseWidget::resizeEvent(event);
+    LayoutToolbar();
+}
+
+void CandleChart::LayoutToolbar()
+{
+    if(!zoomOutButton) return;
+    const QRect plot = GetPlotRect();
+    int x = plot.left() + kZoomGap;
+    const int y = plot.top() + kZoomGap;
+    QWidget* const order[] = { zoomOutButton, zoomInButton, rulerButton, vectorSetBox, colorButton, widthBox,
+                               liqButton };
+    for(QWidget* w : order) {
+        w->move(x, y);
+        w->raise();                         // поверх остальных детей графика
+        x += w->width() + kZoomGap;
+    }
+}
+
+int CandleChart::GetToolbarInset() const
+{
+    return liqButton ? liqButton->geometry().right() + kZoomGap * 2 - GetPlotRect().left() : 8;
+}
+
+void CandleChart::UpdateRulerIcon()
+{
+    if(!rulerButton) return;
+    // линейка наискосок: корпус и риски
+    const qreal dpr = rulerButton->devicePixelRatioF();
+    QPixmap pix(QSize(20, 20) * dpr);
+    pix.setDevicePixelRatio(dpr);
+    pix.fill(Qt::transparent);
+    QPainter p(&pix);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    p.translate(10, 10);
+    p.rotate(-45);
+    const QColor ink = colorText.isValid() ? colorText : QColor(Qt::black);
+    p.setPen(QPen(ink, 1.6));
+    p.setBrush(Qt::NoBrush);
+    p.drawRoundedRect(QRectF(-11, -4, 22, 8), 1.5, 1.5);
+    for(int i = 0; i < 7; ++i) {
+        const double x = -8 + i * 2.7;
+        p.drawLine(QPointF(x, -4), QPointF(x, i % 2 == 0 ? -0.5 : -2));
+    }
+    p.end();
+    rulerButton->setIcon(QIcon(pix));
+}
+
+void CandleChart::SetRulerActive(bool active)
+{
+    if(rulerButton && rulerButton->isChecked() != active) {
+        const QSignalBlocker block(rulerButton);
+        rulerButton->setChecked(active);
+    }
+    hasVectorStart = false;
+    hoverVector = -1;
+    setToolTip(QString());
+    setCursor(active ? Qt::CrossCursor : Qt::ArrowCursor);
+    if(active) setFocus(Qt::OtherFocusReason);
+    update();
+}
+
+void CandleChart::CancelDrawing() { SetRulerActive(false); }
+
+void CandleChart::SetVectors(const QVector<ChartVector>& vectors)
+{
+    lVectors = vectors;
+    hoverVector = -1;           // индексы сменились
+    update();
+}
+
+void CandleChart::SetVectorSets(const QStringList& names, const QString& current)
+{
+    if(!vectorSetBox) return;
+    const QSignalBlocker block(vectorSetBox);
+    vectorSetBox->clear();
+    for(const QString& name : names) vectorSetBox->addItem(name, name);
+    vectorSetBox->insertSeparator(vectorSetBox->count());
+    vectorSetBox->addItem("Новый набор…", QString(kNewSetItem));
+    const int index = std::max(0, vectorSetBox->findData(current));
+    vectorSetBox->setCurrentIndex(index);
+    vectorSetBox->setProperty("current", index);
+}
+
+void CandleChart::SetZoomState(bool canZoomIn, bool canZoomOut, const QString& info)
+{
+    if(!zoomOutButton) return;
+    // setEnabled/setToolTip — только при изменении: не сбивать нажатие и показанную подсказку
+    if(zoomInButton->isEnabled() != canZoomIn) zoomInButton->setEnabled(canZoomIn);
+    if(zoomOutButton->isEnabled() != canZoomOut) zoomOutButton->setEnabled(canZoomOut);
+    const QString suffix = info.isEmpty() ? QString() : "\n" + info;
+    const QString inTip  = (canZoomIn ? "Крупнее: меньше свечей" : "Меньше свечей нельзя") + suffix;
+    const QString outTip = (canZoomOut ? "Мельче: больше свечей" : "Больше свечей нельзя") + suffix;
+    if(zoomInButton->toolTip() != inTip) zoomInButton->setToolTip(inTip);
+    if(zoomOutButton->toolTip() != outTip) zoomOutButton->setToolTip(outTip);
 }
 
 bool CandleChart::ApplyStyleForChild(const Theme& theme)
@@ -71,8 +406,44 @@ bool CandleChart::ApplyStyleForChild(const Theme& theme)
     colorMuted  = c.mutedText;
     colorBg     = c.base;
     colorAccent = c.accent;
+    // непрозрачные кнопки со своим видом: видно наведение, нажатие и «выключено»
+    const QString style = QString(
+        "QPushButton { border: 1px solid %1; border-radius: 4px; background: %2; color: %3;"
+        " font-size: 18px; font-weight: bold; padding: 0 0 2px 0; }"
+        " QPushButton:hover { background: %4; color: %5; border-color: %4; }"
+        " QPushButton:pressed { background: %6; color: %5; border-color: %6; }"
+        " QPushButton:disabled { background: %2; color: %7; border-color: %7; }"
+        " QPushButton:checked { background: %4; border-color: %4; }")
+        .arg(c.border.name(), c.base.name(), c.text.name(), c.accent.name(), c.selectionText.name(),
+             c.accent.darker(125).name(), c.border.name());
+    if(zoomOutButton) {
+        zoomOutButton->setStyleSheet(style);
+        zoomInButton->setStyleSheet(style);
+        rulerButton->setStyleSheet(style);
+        colorButton->setStyleSheet(style);
+        // «череп» включён — красный, как лампочка
+        liqButton->setStyleSheet(style + QString(" QPushButton { font-size: 17px; font-weight: normal; }"
+                                                 " QPushButton:checked { background: %1; border-color: %1; color: #ffffff; }"
+                                                 " QPushButton:checked:hover { background: %2; border-color: %2; }")
+                                             .arg(c.bad.name(), c.bad.lighter(115).name()));
+        UpdateRulerIcon();
+        UpdateColorButton();
+    }
     update();
     return true;
+}
+
+bool CandleChart::eventFilter(QObject* watched, QEvent* event)
+{
+    const bool isToolbar = watched == zoomOutButton || watched == zoomInButton || watched == rulerButton
+                           || watched == vectorSetBox || watched == colorButton || watched == widthBox
+                           || watched == liqButton;
+    if(isToolbar && event->type() == QEvent::Enter && isMouseInside) {
+        isMouseInside = false;
+        hoverVector = -1;
+        update();
+    }
+    return BaseWidget::eventFilter(watched, event);
 }
 
 QSize CandleChart::sizeHint() const { return QSize(800, 420); }
@@ -80,15 +451,44 @@ QSize CandleChart::sizeHint() const { return QSize(800, 420); }
 void CandleChart::SetCandles(const QVector<Candle>& candles, int intervalSec_)
 {
     lCandles = candles;
+    windowSize = lCandles.size();
     intervalSec = intervalSec_ > 0 ? intervalSec_ : 60;
-    // живую цену, пришедшую позже последней свечи, не теряем
-    if(livePrice > 0 && !lCandles.isEmpty()) {
-        Candle& last = lCandles.last();
-        last.close = livePrice;
-        last.high = std::max(last.high, livePrice);
-        last.low = std::min(last.low, livePrice);
-    }
+    ApplyLivePriceToLast();
     update();
+}
+
+void CandleChart::ApplyLivePriceToLast()
+{
+    // живую цену, пришедшую позже последней свечи с сервера, не теряем
+    if(livePrice <= 0 || lCandles.isEmpty()) return;
+    Candle& last = lCandles.last();
+    last.close = livePrice;
+    last.high = std::max(last.high, livePrice);
+    last.low = std::min(last.low, livePrice);
+}
+
+bool CandleChart::MergeCandles(const QVector<Candle>& tail, int intervalSec_)
+{
+    if(lCandles.isEmpty() || tail.isEmpty() || intervalSec_ != intervalSec) return false;
+    const double eps = intervalSec * 0.01;      // время свечей с сервера — ровное, но double
+    QVector<Candle> merged = lCandles;          // на копии: не склеилось — график как был
+    for(const Candle& c : tail) {
+        if(c.ts < merged.first().ts - eps) continue;           // старее окна — не нужна
+        // с конца: свежие свечи почти всегда последние
+        int i = merged.size() - 1;
+        while(i >= 0 && merged[i].ts > c.ts + eps) --i;
+        if(i >= 0 && std::fabs(merged[i].ts - c.ts) <= eps) merged[i] = c;        // обновилась
+        else merged.insert(i + 1, c);                                             // новая (или пропущенная)
+    }
+    // дыра в ряду (монитор «спал», сеть пропадала) — склеить нельзя, нужна полная загрузка
+    const int from = std::max(1, merged.size() - tail.size() - 2);
+    for(int i = from; i < merged.size(); ++i)
+        if(merged[i].ts - merged[i - 1].ts > intervalSec * 1.5) return false;
+    while(windowSize > 0 && merged.size() > windowSize) merged.removeFirst();        // окно не растёт
+    lCandles = merged;
+    ApplyLivePriceToLast();
+    update();
+    return true;
 }
 
 void CandleChart::SetLivePrice(double price, double ts)
@@ -102,7 +502,7 @@ void CandleChart::SetLivePrice(double price, double ts)
             c.ts = last.ts + std::floor((ts - last.ts) / intervalSec) * intervalSec;
             c.open = c.high = c.low = c.close = price;
             lCandles.append(c);
-            if(lCandles.size() > 2) lCandles.removeFirst();     // окно не растёт
+            while(windowSize > 0 && lCandles.size() > windowSize) lCandles.removeFirst();   // окно не растёт
         } else if(ts >= last.ts || ts <= 0) {
             last.close = price;
             last.high = std::max(last.high, price);
@@ -117,19 +517,29 @@ void CandleChart::SetMarkers(const QVector<Marker>& markers) { lMarkers = marker
 void CandleChart::SetMessage(const QString& message_)       { message = message_; update(); }
 const QVector<Candle>& CandleChart::GetCandles() const      { return lCandles; }
 
+QRect CandleChart::GetPlotRect() const
+{
+    return QRect(kPadLeft, kPadTop, width() - kPadLeft - kAxisRight, height() - kPadTop - kAxisBottom);
+}
+
 void CandleChart::Clear()
 {
     lCandles.clear();
+    windowSize = 0;
     lLevels.clear();
     lMarkers.clear();
+    lLiquidations.clear();      // карта ликвидаций — прежней монеты
+    liqMaxUsd = 0;
+    hoverLiquidation = -1;
     livePrice = 0;
+    CancelDrawing();            // векторы не трогаем: их задаёт владелец через SetVectors
     update();
 }
 
 bool CandleChart::MakeFrame(Frame& f) const
 {
     if(lCandles.isEmpty()) return false;
-    f.plot = QRect(kPadLeft, kPadTop, width() - kPadLeft - kAxisRight, height() - kPadTop - kAxisBottom);
+    f.plot = GetPlotRect();
     if(f.plot.width() < 40 || f.plot.height() < 40) return false;
 
     f.tMin = lCandles.first().ts;
@@ -164,9 +574,11 @@ void CandleChart::paintEvent(QPaintEvent* event)
     Frame f;
     if(MakeFrame(f)) {
         DrawGrid(p, f);
+        DrawLiquidations(p, f);     // под свечами и уровнями: это фон-оценка
         DrawLevels(p, f);
         DrawCandles(p, f);
         DrawMarkers(p, f);
+        DrawVectors(p, f);
         DrawLivePrice(p, f);
         if(isMouseInside && f.plot.contains(mousePos)) DrawCrosshair(p, f);
     }
@@ -257,7 +669,8 @@ void CandleChart::DrawLevels(QPainter& p, const Frame& f) const
             const int row = up ? above++ : below++;
             const double y = up ? f.plot.top() + 2 + row * (fm.height() + 2)
                                 : f.plot.bottom() - fm.height() - 2 - row * (fm.height() + 2);
-            const QRectF box(f.plot.left() + 4, y, w, fm.height());
+            const double x = f.plot.left() + (up ? GetToolbarInset() : 4);    // сверху слева — панель кнопок
+            const QRectF box(x, y, w, fm.height());
             p.fillRect(box, colorBg);
             p.setPen(l.color);
             p.drawText(box, Qt::AlignCenter, t);
@@ -331,7 +744,7 @@ void CandleChart::DrawCrosshair(QPainter& p, const Frame& f) const
              FormatPrice(hit->low), FormatPrice(hit->close), change >= 0 ? "+" : "")
         .arg(change, 0, 'f', 2);
     const QFontMetrics fm(p.font());
-    const QRectF box(f.plot.left() + 4, f.plot.top() + 4, fm.horizontalAdvance(text) + 12, fm.height() + 6);
+    const QRectF box(f.plot.left() + GetToolbarInset(), f.plot.top() + 4, fm.horizontalAdvance(text) + 12, fm.height() + 6);
     QColor bg = colorBg;
     bg.setAlpha(230);
     p.fillRect(box, bg);
@@ -341,10 +754,118 @@ void CandleChart::DrawCrosshair(QPainter& p, const Frame& f) const
     p.drawText(box, Qt::AlignCenter, text);
 }
 
+void CandleChart::DrawArrow(QPainter& p, const QPointF& from, const QPointF& to, const QColor& color,
+                            double width, Qt::PenStyle style) const
+{
+    const QLineF line(from, to);
+    if(line.length() < 1) return;
+    p.setPen(QPen(color, width, style, Qt::RoundCap, Qt::RoundJoin));
+    p.setBrush(Qt::NoBrush);
+    p.drawLine(line);
+    // наконечник: треугольник у конца, размер растёт с толщиной
+    const double head = std::min(line.length() * 0.5, 7.0 + width * 2.0);
+    const double angle = std::atan2(from.y() - to.y(), from.x() - to.x());
+    const double spread = 0.45;     // полуугол раствора, рад
+    QPainterPath path;
+    path.moveTo(to);
+    path.lineTo(to + QPointF(std::cos(angle + spread) * head, std::sin(angle + spread) * head));
+    path.lineTo(to + QPointF(std::cos(angle - spread) * head, std::sin(angle - spread) * head));
+    path.closeSubpath();
+    p.setPen(QPen(color, 1, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    p.setBrush(color);
+    p.drawPath(path);
+    p.setBrush(Qt::NoBrush);
+}
+
+void CandleChart::DrawVectors(QPainter& p, const Frame& f) const
+{
+    p.save();
+    p.setClipRect(f.plot);          // векторы за краем окна обрезаются, а не лезут на оси
+    for(int i = 0; i < lVectors.size(); ++i) {
+        const ChartVector& v = lVectors[i];
+        const QPointF a(f.X(v.t1), f.Y(v.p1)), b(f.X(v.t2), f.Y(v.p2));
+        const QPointF end = RayEnd(a, b, f.plot);       // луч: из a через b до края, стрелка у края
+        if(i == hoverVector) {      // под курсором: полупрозрачный ореол и точки кликов — правый клик даст меню
+            QColor halo = v.color;
+            halo.setAlpha(70);
+            DrawArrow(p, a, end, halo, v.width + 6);
+        }
+        DrawArrow(p, a, end, v.color, v.width);
+        if(i == hoverVector) {
+            p.setPen(QPen(colorBg, 1));
+            p.setBrush(v.color);
+            p.drawEllipse(a, v.width + 2.5, v.width + 2.5);
+            p.drawEllipse(b, v.width + 2.5, v.width + 2.5);
+            p.setBrush(Qt::NoBrush);
+        }
+    }
+    // начатый вектор: пунктирный луч от первой точки через курсор
+    if(hasVectorStart) {
+        const QPointF start(f.X(startTs), f.Y(startPrice));
+        p.setPen(Qt::NoPen);
+        p.setBrush(colorAccent);
+        p.drawEllipse(start, 3.5, 3.5);
+        if(isMouseInside && QLineF(start, mousePos).length() >= kMinVectorPx)
+            DrawArrow(p, start, RayEnd(start, mousePos, f.plot), colorAccent, 2, Qt::DashLine);
+    }
+    p.restore();
+}
+
+void CandleChart::mousePressEvent(QMouseEvent* event)
+{
+    if(!rulerButton || !rulerButton->isChecked()) {
+        const int index = event->button() == Qt::RightButton ? VectorAt(event->pos()) : -1;
+        if(index >= 0) ShowVectorMenu(index, event->globalPos());
+        else BaseWidget::mousePressEvent(event);
+        return;
+    }
+    if(event->button() == Qt::RightButton) { CancelDrawing(); return; }
+    if(event->button() != Qt::LeftButton) return;
+
+    Frame f;
+    if(!MakeFrame(f) || !f.plot.contains(event->pos())) return;     // клик мимо свечей — ждём дальше
+    const double ts = f.tMin + (event->pos().x() - f.plot.left()) / double(f.plot.width()) * (f.tMax - f.tMin);
+    const double price = f.PriceAt(event->pos().y());
+    if(!hasVectorStart) {
+        hasVectorStart = true;
+        startTs = ts;
+        startPrice = price;
+        update();
+        return;
+    }
+    if(QLineF(QPointF(f.X(startTs), f.Y(startPrice)), event->pos()).length() < kMinVectorPx) return;
+    const double t1 = startTs, p1 = startPrice;
+    SetRulerActive(false);          // один вектор на одно нажатие линейки
+    emit VectorDrawn(t1, p1, ts, price);
+}
+
+void CandleChart::keyPressEvent(QKeyEvent* event)
+{
+    if(event->key() == Qt::Key_Escape && rulerButton && rulerButton->isChecked()) {
+        CancelDrawing();
+        return;
+    }
+    BaseWidget::keyPressEvent(event);
+}
+
 void CandleChart::mouseMoveEvent(QMouseEvent* event)
 {
     mousePos = event->pos();
     isMouseInside = true;
+    if(!rulerButton || !rulerButton->isChecked()) {
+        const int hit = VectorAt(mousePos);
+        if(hit != hoverVector) {
+            hoverVector = hit;
+            setCursor(hit >= 0 ? Qt::PointingHandCursor : Qt::ArrowCursor);
+            setToolTip(hit >= 0 ? QString("Правый клик — цвет, толщина, удалить") : QString());
+        }
+    }
+    // черточка ликвидаций под курсором — подсказка сразу, без задержки; вектор важнее
+    const int liq = hoverVector < 0 ? LiquidationAt(mousePos) : -1;
+    if(liq != hoverLiquidation) {
+        hoverLiquidation = liq;
+        UpdateLiquidationToolTip();
+    }
     update();
     BaseWidget::mouseMoveEvent(event);
 }
@@ -352,8 +873,114 @@ void CandleChart::mouseMoveEvent(QMouseEvent* event)
 void CandleChart::leaveEvent(QEvent* event)
 {
     isMouseInside = false;
+    hoverVector = -1;
+    if(hoverLiquidation >= 0) {
+        hoverLiquidation = -1;
+        QToolTip::hideText();
+    }
     update();
     BaseWidget::leaveEvent(event);
+}
+
+void CandleChart::SetLiquidations(const QVector<LiqLevel>& levels, double step)
+{
+    lLiquidations = levels;
+    liqStep = step > 0 ? step : 0;
+    liqMaxUsd = 0;
+    for(const LiqLevel& l : lLiquidations) liqMaxUsd = std::max(liqMaxUsd, l.longUsd + l.shortUsd);
+    hoverLiquidation = -1;
+    update();
+}
+
+void CandleChart::SetLiquidationsActive(bool active)
+{
+    if(!liqButton || liqButton->isChecked() == active) return;
+    const QSignalBlocker block(liqButton);
+    liqButton->setChecked(active);
+    hoverLiquidation = -1;
+    UpdateLiquidationButtonTip();
+    update();
+}
+
+bool CandleChart::IsLiquidationsActive() const { return liqButton && liqButton->isChecked(); }
+
+void CandleChart::SetLiquidationsInfo(const QString& info)
+{
+    liqInfo = info;
+    UpdateLiquidationButtonTip();
+}
+
+QRectF CandleChart::LiquidationRect(const Frame& f, int index) const
+{
+    const LiqLevel& l = lLiquidations[index];
+    const double usd = l.longUsd + l.shortUsd;
+    if(liqMaxUsd <= 0 || usd < liqMaxUsd * kLiqMinShare || !f.InRange(l.price)) return QRectF();
+    // длина — от объёма (корень: мелкие уровни не пропадают), толщина — шаг уровней на экране
+    const double length = std::max(6.0, f.plot.width() * kLiqMaxLength * std::sqrt(usd / liqMaxUsd));
+    const double stepPx = liqStep > 0 ? std::fabs(f.Y(l.price) - f.Y(l.price + liqStep)) : 3;
+    const double height = std::clamp(stepPx * 0.75, 2.0, 8.0);
+    return QRectF(f.plot.right() - length, f.Y(l.price) - height / 2, length, height);
+}
+
+void CandleChart::DrawLiquidations(QPainter& p, const Frame& f) const
+{
+    if(!IsLiquidationsActive() || lLiquidations.isEmpty()) return;
+    p.save();
+    p.setClipRect(f.plot);
+    p.setPen(Qt::NoPen);
+    for(int i = 0; i < lLiquidations.size(); ++i) {
+        const QRectF r = LiquidationRect(f, i);
+        if(r.isEmpty()) continue;
+        const LiqLevel& l = lLiquidations[i];
+        // зелёные — лонги (сгорят при падении), красные — шорты (при росте); ярче — крупнее
+        QColor color = l.longUsd >= l.shortUsd ? colorUp : colorDown;
+        const double share = (l.longUsd + l.shortUsd) / liqMaxUsd;
+        color.setAlpha(i == hoverLiquidation ? 255 : int(70 + 150 * std::sqrt(share)));
+        p.fillRect(r, color);
+    }
+    p.restore();
+}
+
+int CandleChart::LiquidationAt(const QPoint& pos) const
+{
+    Frame f;
+    if(!IsLiquidationsActive() || lLiquidations.isEmpty() || !MakeFrame(f) || !f.plot.contains(pos)) return -1;
+    int best = -1;
+    double bestDist = 0;
+    for(int i = 0; i < lLiquidations.size(); ++i) {
+        const QRectF r = LiquidationRect(f, i);
+        if(r.isEmpty() || !r.adjusted(0, -3, 0, 3).contains(pos)) continue;
+        const double dist = std::fabs(r.center().y() - pos.y());       // соседние черточки близко: ближайшая
+        if(best < 0 || dist < bestDist) { best = i; bestDist = dist; }
+    }
+    return best;
+}
+
+void CandleChart::UpdateLiquidationButtonTip()
+{
+    if(!liqButton) return;
+    QString tip = IsLiquidationsActive() ? "Карта ликвидаций включена — нажать, чтобы убрать"
+                                         : "Показать карту ликвидаций (оценка)";
+    tip += "\nЗелёные черточки — лонги сгорят при падении до цены, красные — шорты при росте.\n"
+           "Длина — объём. Наведите на черточку — сколько там ликвидирует.";
+    if(!liqInfo.isEmpty()) tip += "\n" + liqInfo;
+    if(liqButton->toolTip() != tip) liqButton->setToolTip(tip);
+}
+
+void CandleChart::UpdateLiquidationToolTip()
+{
+    if(hoverLiquidation < 0 || hoverLiquidation >= lLiquidations.size()) {
+        QToolTip::hideText();
+        return;
+    }
+    const LiqLevel& l = lLiquidations[hoverLiquidation];
+    const double now = livePrice > 0 ? livePrice : (lCandles.isEmpty() ? 0 : lCandles.last().close);
+    QString text = QString("<b>%1</b>").arg(FormatPrice(l.price));
+    if(now > 0) text += QString(" (%1%2% от цены)").arg(l.price >= now ? "+" : "").arg((l.price - now) / now * 100, 0, 'f', 2);
+    if(l.longUsd > 0)  text += "<br>лонги: ≈ <b>" + FormatUsd(l.longUsd) + "</b> — сгорят при падении сюда";
+    if(l.shortUsd > 0) text += "<br>шорты: ≈ <b>" + FormatUsd(l.shortUsd) + "</b> — сгорят при росте сюда";
+    text += "<br><span style='color:gray'>оценка по открытому интересу OKX, плечи угаданы</span>";
+    QToolTip::showText(mapToGlobal(mousePos), text, this);
 }
 
 } // Trade

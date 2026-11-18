@@ -40,7 +40,7 @@ QVector<Candle> Candle::ListFromJson(const QJsonArray& array)
 
 int IntervalSeconds(const QString& interval)
 {
-    static const QRegularExpression re("^(\\d+)([smhd])$");
+    static const QRegularExpression re("^(\\d+)([smhdw])$");
     const QRegularExpressionMatch m = re.match(interval.trimmed().toLower());
     if(!m.hasMatch()) return 0;
     const int n = m.captured(1).toInt();
@@ -49,6 +49,7 @@ int IntervalSeconds(const QString& interval)
         case 'm': return n * 60;
         case 'h': return n * 3600;
         case 'd': return n * 86400;
+        case 'w': return n * 7 * 86400;
         default:  return 0;
     }
 }

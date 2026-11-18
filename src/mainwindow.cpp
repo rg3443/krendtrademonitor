@@ -6,6 +6,7 @@
 #include "bot/botview.h"
 #include "market/candle.h"
 #include "market/marketview.h"
+#include "orders/ordersview.h"
 #include "serverlog/serverlogview.h"
 #include "QtInterface/components/logwidget.h"
 #include "QtInterface/components/tabwidget.h"
@@ -46,6 +47,9 @@ MainWindow::MainWindow(const AppConfig& config, ApiClient* api_, Poller* poller_
 
     bottomTabs = Create<TabWidget>(nullptr);
     bottomTabs->AddTab(Create<ServerLogView>(nullptr, api, poller), "Лог сервера");
+    auto* orders = Create<OrdersView>(nullptr, api, poller);
+    bottomTabs->AddTab(orders, "Ордера");
+    connect(market, &MarketView::OrderPlaced, orders, &OrdersView::OnUpdate);
     bottomTabs->AddTab(Create<AdviceView>(nullptr, api), "Рекомендации");
     bottomTabs->AddTab(Create<LogWidget>(nullptr), "Журнал монитора");
 

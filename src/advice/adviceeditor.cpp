@@ -1,5 +1,6 @@
 #include "adviceeditor.h"
 
+#include "advice/advicefile.h"
 #include "QtInterface/net/apiclient.h"
 #include "QtInterface/style/theme.h"
 
@@ -8,6 +9,7 @@
 #include <QDateTime>
 #include <QFontDatabase>
 #include <QHBoxLayout>
+#include <QInputDialog>
 #include <QJsonObject>
 #include <QLabel>
 #include <QMessageBox>
@@ -49,6 +51,11 @@ AdviceEditor::AdviceEditor(QWidget* parent, ApiClient* api_, const QString& name
 }
 
 QString AdviceEditor::GetName() const { return name; }
+
+bool AdviceEditor::IsModified() const
+{
+    return text && (text->document()->isModified() || (isNew && !text->toPlainText().isEmpty()));
+}
 
 bool AdviceEditor::InitForChild()
 {
@@ -161,6 +168,13 @@ void AdviceEditor::Save(bool force)
     auto onReply = [this](const ApiReply& reply) {
         isBusy = false;
         const ThemeColors& c = Theme::Instance().GetColors();
+        if(reply.httpStatus == 400 && isNew) {
+            // имя не принято сервером: текст не терять — предложить другое имя и сохранить под ним
+            SetModified(true);
+            if(AskNewName(reply.error)) Save(false);
+            else SetStatus("не сохранено: " + reply.error, c.bad);
+            return;
+        }
         if(reply.httpStatus == 409 && isNew) {
             SetModified(true);
             SetStatus("не сохранено: файл «" + name + "» уже есть на сервере", c.warning);
@@ -197,6 +211,29 @@ void AdviceEditor::Save(bool force)
         api->Put(path, QJsonDocument(QJsonObject{ { "text", text->toPlainText() }, { "mtime", mtime } }), onReply, this);
 }
 
+bool AdviceEditor::AskNewName(const QString& reason)
+{
+    QString label = "Сервер не принял имя «" + name + "»:\n" + reason + "\n\nСохранить под другим именем:";
+    QString candidate = AdviceFile::SuggestName(name);
+    for(;;) {
+        bool ok = false;
+        candidate = QInputDialog::getText(this, "Другое имя", label, QLineEdit::Normal, candidate, &ok).trimmed();
+        if(!ok || candidate.isEmpty()) return false;
+        if(!candidate.endsWith(".md", Qt::CaseInsensitive) && !candidate.endsWith(".txt", Qt::CaseInsensitive))
+            candidate += ".md";
+        QString why;
+        if(AdviceFile::IsValidName(candidate, &why)) break;
+        label = "Имя «" + candidate + "» не годится: " + why + ".\n\nСохранить под другим именем:";
+        candidate = AdviceFile::SuggestName(candidate);
+    }
+    const QString oldName = name;
+    name = candidate;
+    setObjectName(name);
+    SetModified(true);          // заголовок окна — с новым именем
+    emit Renamed(oldName, name);
+    return true;
+}
+
 void AdviceEditor::SetModified(bool modified)
 {
     saveButton->setEnabled(modified && !isBusy);
@@ -211,7 +248,7 @@ void AdviceEditor::SetStatus(const QString& message, const QColor& color)
 void AdviceEditor::closeEvent(QCloseEvent* event)
 {
     // крестик не сохраняет — только переспрашивает, если есть правки
-    if(text && (text->document()->isModified() || (isNew && !text->toPlainText().isEmpty()))) {
+    if(IsModified()) {
         if(!Ask(this, QMessageBox::Question, "Несохранённые правки",
                 "Закрыть «" + name + "» без сохранения? Правки пропадут.", "Закрыть без сохранения", "Остаться")) {
             event->ignore();

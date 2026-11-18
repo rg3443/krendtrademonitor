@@ -70,6 +70,7 @@ namespace Trade {
         bool                    isWaitingForPlan;   //!< \brief вызвали — ждём новый план
 
         QLabel*                 status;
+        QLabel*                 botBudget;
         QCheckBox*              showPlans;
         QCheckBox*              showEvents;
         QCheckBox*              showNotify;

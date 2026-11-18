@@ -45,6 +45,8 @@ add_executable(krendtrademonitor WIN32
     src/market/candle.cpp
     src/market/candlechart.h
     src/market/candlechart.cpp
+    src/market/vectorstore.h
+    src/market/vectorstore.cpp
     src/market/symbolpicker.h
     src/market/symbolpicker.cpp
     src/market/marketview.h
@@ -53,6 +55,10 @@ add_executable(krendtrademonitor WIN32
     src/bot/botview.cpp
     src/serverlog/serverlogview.h
     src/serverlog/serverlogview.cpp
+    src/orders/ordersview.h
+    src/orders/ordersview.cpp
+    src/orders/orderdialog.h
+    src/orders/orderdialog.cpp
     src/advice/advicefile.h
     src/advice/advicefile.cpp
     src/advice/adviceview.h

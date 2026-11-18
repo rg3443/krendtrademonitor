@@ -20,7 +20,16 @@ namespace Trade {
          */
         static std::vector<AdviceFile>  ListFromJson(const QJsonDocument& json, QString* error);
 
-        //! \brief Имя годится для сервера: *.md / *.txt, без путей, не README.md.
+        /*!
+         *  \brief Подобрать годное имя: кириллица — латиницей, прочие символы — «-», без «.md» — допишет.
+         *  «05тест.md» → «05test.md». Если и так ничего не выходит — «advice.md».
+         */
+        static QString                  SuggestName(const QString& name);
+
+        /*!
+         *  \brief Имя годится для сервера — то же правило, что у него (ADVICE_RE в bot/api.py):
+         *  латиница, цифры, «.», «-», «_», пробел; начинается с буквы или цифры; *.md / *.txt; не README.md.
+         */
         static bool                     IsValidName(const QString& name, QString* why = nullptr);
     };
 }

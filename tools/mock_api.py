@@ -3,7 +3,7 @@
     python tools/mock_api.py            # слушает 127.0.0.1:8900, токен любой
 
 Отдаёт /api/state, plans, events, trades, logs (с курсором after), candles, ticker,
-symbols, advice (GET/PUT, 409 при чужой правке) и WebSocket /api/stream (hello, tick, state, plan, notify).
+symbols, advice (GET/PUT/POST/DELETE, 409 при чужой правке) и WebSocket /api/stream (hello, tick, state, plan, notify).
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import random
+import re
 import socket
 import struct
 import threading
@@ -22,8 +23,13 @@ from urllib.parse import parse_qs, unquote, urlparse
 PORT = 8900
 BASE = {"BTCUSDT": 64300.0, "ETHUSDT": 3410.0, "1000PEPEUSDT": 0.0105, "SOLUSDT": 152.0, "XRPUSDT": 0.52,
         "DOGEUSDT": 0.16, "BNBUSDT": 590.0, "1000BONKUSDT": 0.024, "SUIUSDT": 1.9, "LINKUSDT": 14.2}
-RANGES = {"15m": (60, 15), "30m": (60, 30), "1h": (60, 60), "4h": (300, 48), "12h": (300, 144), "24h": (900, 96),
-          "7d": (3600, 168)}
+INTERVALS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400, "12h": 43200,
+             "1d": 86400, "1w": 604800}  # размер свечи, сек
+RANGES = {"15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400, "12h": 43200, "24h": 86400,
+          "7d": 604800, "30d": 2592000, "90d": 7776000, "1y": 31536000,
+          "2y": 63072000, "3y": 94608000, "5y": 157680000}  # окно, сек
+CANDLES_MAX = 2100
+ADVICE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,80}\.(md|txt)$")    # как в bot/api.py сервера
 
 lock = threading.Lock()
 advice = {"01-general.md": ("# Общие\nТоргуй аккуратно.\n", time.time() - 86400),
@@ -47,8 +53,21 @@ def price_at(symbol: str, ts: float) -> float:
     return b * (1 + 0.004 * math.sin(ts / 900 + seed) + 0.002 * math.sin(ts / 97 + seed * 2) + 0.0007 * math.sin(ts / 13))
 
 
-def candles(symbol: str, rng: str) -> dict:
-    step, n = RANGES.get(rng, RANGES["1h"])
+def candles(symbol: str, rng: str | None, interval: str, limit: int | None = None) -> tuple[dict | str, int]:
+    """Как на сервере: свечей = range ÷ interval, или limit последних (без range);
+    (данные, 200) или (текст ошибки, 400)."""
+    if rng and limit:
+        return "задай либо range (окно), либо limit (количество свечей), не оба", 400
+    if not limit:
+        rng = rng or "1h"
+    if (rng and rng not in RANGES) or interval not in INTERVALS:
+        return f"неизвестные range={rng} / interval={interval}", 400
+    step = INTERVALS[interval]
+    n = limit or RANGES[rng] // step
+    if n < 1:
+        return f"окно range={rng} меньше одной свечи interval={interval}", 400
+    if n > CANDLES_MAX:
+        return f"range={rng} / interval={interval} = {n} свечей, максимум {CANDLES_MAX}", 400
     now = time.time()
     start = (now // step) * step - (n - 1) * step
     out = []
@@ -56,8 +75,31 @@ def candles(symbol: str, rng: str) -> dict:
         t0 = start + i * step
         pts = [price_at(symbol, t0 + k * step / 6) for k in range(7) if t0 + k * step / 6 <= now]
         out.append({"ts": t0, "open": pts[0], "high": max(pts), "low": min(pts), "close": pts[-1], "volume": 10.0})
-    return {"symbol": symbol, "range": rng, "interval": {60: "1m", 300: "5m", 900: "15m", 3600: "1h"}[step], "source": "mock",
-            "candles": out}
+    return {"symbol": symbol, "range": rng, "interval": interval, "count": n, "source": "mock", "candles": out}, 200
+
+
+def liqmap(symbol: str, top: int) -> dict:
+    """Как /api/liqmap сервера (оценка): уровни ±10% от цены, лонги ниже, шорты выше; кластеры по синусам."""
+    price = price_at(symbol, time.time())
+    raw_step = price * 0.001                                    # ~0.1% цены, «круглый» шаг
+    mag = 10 ** math.floor(math.log10(raw_step))
+    step = next(m * mag for m in (1, 2, 5, 10) if m * mag >= raw_step)
+    seed = sum(map(ord, symbol))
+    levels = []
+    lo, hi = math.ceil(price * 0.9 / step), math.floor(price * 1.1 / step)
+    for k in range(lo, hi + 1):
+        lvl = k * step
+        dist = (lvl - price) / price
+        if abs(dist) < 0.002:
+            continue                                            # у самой цены уже сгорело
+        base = 4e5 * (1 + math.sin(k * 0.37 + seed)) * (1 + 2 * math.exp(-((abs(dist) - 0.02) / 0.01) ** 2))
+        spike = 6e6 if (k + seed) % 23 == 0 else 0              # редкие крупные кластеры
+        usd = round(base + spike * (1 - abs(dist) * 5))
+        levels.append({"price": lvl, "long_usd": usd if lvl < price else 0, "short_usd": usd if lvl > price else 0})
+    side = lambda key: sorted(({"price": l["price"], "usd": l[key], "dist_pct": round((l["price"] - price) / price * 100, 2)}
+                               for l in levels if l[key] > 0), key=lambda x: -x["usd"])[:top]
+    return {"symbol": symbol, "source": "mock", "ts": time.time(), "price": price, "step": step,
+            "above": side("short_usd"), "below": side("long_usd"), "levels": levels}
 
 
 def add_log(msg: str, level: str = "INFO") -> None:
@@ -212,7 +254,14 @@ class H(BaseHTTPRequestHandler):
                     lines = [x for x in lines if g in x]
                 return self.reply({"lines": lines, "offset": len(log_lines)})
         if p == "/api/candles":
-            return self.reply(candles(q.get("symbol", "BTCUSDT").upper(), q.get("range", "1h")))
+            data, status = candles(q.get("symbol", "BTCUSDT").upper(), q.get("range"), q.get("interval", "15m"),
+                                   int(q["limit"]) if q.get("limit") else None)
+            return self.reply(data, status, ok=status == 200)
+        if p == "/api/liqmap":
+            m = liqmap(q.get("symbol", "BTCUSDT").upper(), max(1, min(50, int(q.get("top") or 10))))
+            if q.get("levels") == "false":
+                m.pop("levels")
+            return self.reply(m)
         if p.startswith("/api/ticker/"):
             s = unquote(p.rsplit("/", 1)[1]).upper()
             if s.startswith("COIN"):   # пример отказа торгового API с кодом
@@ -227,6 +276,8 @@ class H(BaseHTTPRequestHandler):
             lst = [{"symbol": s, "base": s.replace("USDT", "").replace("1000", ""), "turnover_24h": BASE[s] * 1e6}
                    for s in BASE] + [{"symbol": f"COIN{i}USDT", "base": f"COIN{i}", "turnover_24h": 0} for i in range(30)]
             return self.reply({"symbols": lst, "ready": True, "error": None})
+        if p == "/api/orders":
+            return self.reply(open_orders)
         if p == "/api/advice":
             return self.reply([{"name": n, "size": len(t.encode()), "mtime": m} for n, (t, m) in sorted(advice.items())])
         if p.startswith("/api/advice/"):
@@ -261,8 +312,34 @@ class H(BaseHTTPRequestHandler):
             broadcast("event", ev)
             add_log(f"replan по запросу оператора: {comment}")
             return self.reply({"accepted": True})
+        if p == "/api/order/cancel":
+            key = b.get("order_id") or b.get("order_link_id")
+            left = [o for o in open_orders if key not in (o["order_id"], o["order_link_id"])]
+            if not key or len(left) == len(open_orders):
+                return self.reply("нет такого ордера", 404, ok=False)
+            open_orders[:] = left
+            return self.reply({"order_id": b.get("order_id"), "order_link_id": b.get("order_link_id")})
+        if p == "/api/order":
+            if b.get("order_type") == "Limit" and not b.get("price"):
+                return self.reply("для Limit нужна price", 400, ok=False)
+            link = f"main-{int(time.time())}-{len(open_orders):04x}"
+            if b.get("order_type") == "Limit":      # рыночный исполняется сразу и в открытых не висит
+                open_orders.append({
+                    "order_id": f"mock-{len(open_orders) + 1}", "order_link_id": link, "symbol": b.get("symbol"),
+                    "side": b.get("side"), "order_type": "Limit", "stop_order_type": None,
+                    "qty": float(b.get("qty") or 0), "price": float(b.get("price") or 0), "trigger_price": None,
+                    "stop_loss": float(b["stop_loss"]) if b.get("stop_loss") else None,
+                    "take_profit": float(b["take_profit"]) if b.get("take_profit") else None,
+                    "reduce_only": bool(b.get("reduce_only")), "status": "New", "created": time.time(),
+                    "owner": "monitor"})
+            warnings = [] if b.get("stop_loss") or b.get("reduce_only") else ["нет стоп-лосса"]
+            return self.reply({"order_id": f"mock-{len(open_orders)}", "order_link_id": link, "account": "main",
+                               "warnings": warnings})
         if p == "/api/advice":
             n = b.get("name", "")
+            if not ADVICE_RE.match(n) or ".." in n or n.lower() == "readme.md":    # как на сервере
+                return self.reply("имя: только *.md или *.txt из букв, цифр, «.-_ », без «/» и «..»; README.md нельзя",
+                                  400, ok=False)
             if n in advice:
                 return self.reply("файл уже есть", 409, ok=False)
             advice[n] = (b.get("text", ""), time.time())
@@ -283,6 +360,26 @@ class H(BaseHTTPRequestHandler):
             advice[n] = (b.get("text", ""), time.time())
             return self.reply({"name": n, "size": len(advice[n][0].encode()), "mtime": advice[n][1]})
         return self.reply("нет такого метода", 404, ok=False)
+
+    def do_DELETE(self):
+        u = urlparse(self.path)
+        if u.path.startswith("/api/advice/"):
+            n = unquote(u.path.split("/api/advice/", 1)[1])
+            if n not in advice:
+                return self.reply("нет такого файла", 404, ok=False)
+            mt = parse_qs(u.query).get("mtime", [""])[0]
+            try:
+                mt = float(mt)
+            except ValueError:
+                return self.reply("нужен mtime", 400, ok=False)
+            if abs(advice[n][1] - mt) > 1e-3:
+                return self.reply("файл изменился на сервере", 409, ok=False)
+            del advice[n]
+            return self.reply({"name": n, "deleted": True})
+        return self.reply("нет такого метода", 404, ok=False)
+
+
+open_orders = []        # открытые ордера оператора: пополняются лимитными из POST /api/order
 
 
 if __name__ == "__main__":

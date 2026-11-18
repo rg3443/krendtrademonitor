@@ -22,7 +22,8 @@ namespace Trade {
     /*!
      *  \brief Конфигурация бота: файлы-рекомендации стратегу (advice/ на сервере).
      *  Таблица файлов (GET /api/advice), напротив каждого — «Открыть»: окно AdviceEditor
-     *  с текстом и кнопкой «Сохранить». «Новый…» создаёт файл.
+     *  с текстом и кнопкой «Сохранить»; «Удалить» — удалить файл на сервере
+     *  (с подтверждением). «Новый…» создаёт файл.
      *  Все файлы целиком попадают в системный промпт Claude при каждом пересмотре плана.
      */
     class AdviceView : public QtInterface::BaseWidget {
@@ -39,6 +40,8 @@ namespace Trade {
         void                    Request();
         void                    Open(const QString& name, bool isNew);
         void                    CreateNew();
+        //! \brief DELETE /api/advice/{name}?mtime=… (mtime из списка; 409 — файл изменили после чтения).
+        void                    Delete(const QString& name);
 
         QtInterface::ApiClient*     api;
         AdviceModel*                model;

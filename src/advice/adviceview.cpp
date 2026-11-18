@@ -16,15 +16,30 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QTableView>
+#include <QUrl>
 
 using namespace QtInterface;
 
 namespace Trade {
 
+namespace {
+    //! \brief Вопрос с русскими кнопками (переводы Qt не поставляются). \return true — «да».
+    bool Ask(QWidget* parent, const QString& title, const QString& text, const QString& yesText, const QString& noText)
+    {
+        QMessageBox box(QMessageBox::Warning, title, text, QMessageBox::NoButton, parent);
+        QPushButton* yes = box.addButton(yesText, QMessageBox::DestructiveRole);
+        QPushButton* no = box.addButton(noText, QMessageBox::RejectRole);
+        box.setDefaultButton(no);
+        box.setEscapeButton(no);
+        box.exec();
+        return box.clickedButton() == yes;
+    }
+}
+
 //! \brief Таблица файлов-рекомендаций.
 class AdviceModel : public BaseTableModel<AdviceFile, QString> {
 public:
-    enum Column { ColName, ColSize, ColMtime, ColOpen };
+    enum Column { ColName, ColSize, ColMtime, ColOpen, ColDelete };
 
     explicit AdviceModel(QObject* parent)
         : BaseTableModel<AdviceFile, QString>([](const AdviceFile& f) { return f.name; }, parent)
@@ -39,6 +54,7 @@ public:
                                            : QString("—");
                     } });
         AddColumn({ "", [](const AdviceFile&) { return QString("Открыть"); } });
+        AddColumn({ "", [](const AdviceFile&) { return QString("Удалить"); } });
     }
 };
 
@@ -65,7 +81,11 @@ bool AdviceView::InitForChild()
     table->GetDelegate()->BindColumn(AdviceModel::ColOpen, Cells::Button("Открыть", [this](const QModelIndex& index) {
         Open(index.sibling(index.row(), AdviceModel::ColName).data(Qt::EditRole).toString(), false);
     }));
+    table->GetDelegate()->BindColumn(AdviceModel::ColDelete, Cells::Button("Удалить", [this](const QModelIndex& index) {
+        Delete(index.sibling(index.row(), AdviceModel::ColName).data(Qt::EditRole).toString());
+    }));
     connect(table->GetTable(), &QTableView::doubleClicked, this, [this](const QModelIndex& index) {
+        if(index.column() == AdviceModel::ColDelete) return;
         Open(index.sibling(index.row(), AdviceModel::ColName).data(Qt::EditRole).toString(), false);
     });
 
@@ -141,21 +161,27 @@ void AdviceView::Open(const QString& name, bool isNew)
     }
     auto* editor = Create<AdviceEditor>(this, api, name, isNew);
     connect(editor, &AdviceEditor::Saved, this, &AdviceView::Request);
+    connect(editor, &AdviceEditor::Renamed, this, [this, editor](const QString& oldName, const QString& newName) {
+        if(lEditors.value(oldName) == editor) lEditors.remove(oldName);
+        lEditors.insert(newName, editor);
+    });
     lEditors.insert(name, editor);
     editor->show();
 }
 
 void AdviceView::CreateNew()
 {
-    bool ok = false;
-    QString name = QInputDialog::getText(this, "Новая рекомендация", "Имя файла (.md или .txt):",
-                                         QLineEdit::Normal, "05-.md", &ok).trimmed();
-    if(!ok || name.isEmpty()) return;
-    if(!name.contains('.')) name += ".md";
-    QString why;
-    if(!AdviceFile::IsValidName(name, &why)) {
-        QMessageBox::warning(this, "Новая рекомендация", "Имя «" + name + "» не годится: " + why);
-        return;
+    QString name = "05-.md";
+    QString label = "Имя файла (.md или .txt, латиницей):";
+    for(;;) {       // не годится — спросить снова, подставив латинский вариант («05тест.md» → «05test.md»)
+        bool ok = false;
+        name = QInputDialog::getText(this, "Новая рекомендация", label, QLineEdit::Normal, name, &ok).trimmed();
+        if(!ok || name.isEmpty()) return;
+        if(!name.endsWith(".md", Qt::CaseInsensitive) && !name.endsWith(".txt", Qt::CaseInsensitive)) name += ".md";
+        QString why;
+        if(AdviceFile::IsValidName(name, &why)) break;
+        label = "Имя «" + name + "» не годится: " + why + ".\n\nПредлагаю латиницей — поправьте, если нужно:";
+        name = AdviceFile::SuggestName(name);
     }
     if(model->FindRow(name) >= 0) {
         QMessageBox::information(this, "Новая рекомендация", "«" + name + "» уже есть — открываю его.");
@@ -163,6 +189,45 @@ void AdviceView::CreateNew()
         return;
     }
     Open(name, true);
+}
+
+void AdviceView::Delete(const QString& name)
+{
+    if(name.isEmpty()) return;
+    const AdviceFile* file = model->GetRow(model->FindRow(name));
+    if(!file) return;
+    const double mtime = file->mtime;      // версия из GET /api/advice: если файл изменили после — сервер ответит 409
+
+    QString text = "Удалить «" + name + "» с сервера?\n\nСтратег перестанет получать эту рекомендацию "
+                   "со следующего плана. Отменить удаление нельзя.";
+    QPointer<AdviceEditor> editor = lEditors.value(name);
+    if(editor && editor->IsModified())
+        text += "\n\nОкно с этим файлом открыто — несохранённые правки в нём пропадут.";
+    else if(editor)
+        text += "\n\nОткрытое окно с этим файлом закроется.";
+    if(!Ask(this, "Удалить рекомендацию", text, "Удалить", "Отмена")) return;
+
+    QString path = "/api/advice/" + QString(QUrl::toPercentEncoding(name));
+    if(mtime > 0) path += "?mtime=" + QString::number(mtime, 'g', 17);
+    api->Delete(path, [this, name](const ApiReply& reply) {
+        const ThemeColors& c = Theme::Instance().GetColors();
+        if(reply.httpStatus == 409) {
+            QMessageBox::warning(this, "Удалить рекомендацию",
+                                 "«" + name + "» изменили на сервере после загрузки списка — не удалено.\n"
+                                 "Список обновлён: проверьте файл и удалите ещё раз, если нужно.");
+            Request();
+            return;
+        }
+        if(!reply.ok && reply.httpStatus != 404) {      // 404 — файла уже нет, цель достигнута
+            summary->setText(QString("<span style='color:%1'>«%2» не удалён: %3</span>")
+                                 .arg(c.bad.name(), name.toHtmlEscaped(), reply.error.toHtmlEscaped()));
+            return;
+        }
+        LogMsg("рекомендация удалена на сервере: " + name);
+        if(QPointer<AdviceEditor> e = lEditors.take(name))
+            e->deleteLater();       // мимо closeEvent: про правки уже спросили
+        Request();
+    }, this);
 }
 
 } // Trade

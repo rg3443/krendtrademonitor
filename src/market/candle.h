@@ -20,7 +20,7 @@ namespace Trade {
         static QVector<Candle>  ListFromJson(const QJsonArray& array);
     };
 
-    //! \brief Интервал свечи "1m" / "5m" / "1h" → секунды (0, если не разобрать).
+    //! \brief Интервал свечи "1m" / "5m" / "1h" / "1d" / "1w" → секунды (0, если не разобрать).
     int         IntervalSeconds(const QString& interval);
 
     //! \brief Цена с разумным числом знаков: 64396.7, 3412.55, 0.003816.

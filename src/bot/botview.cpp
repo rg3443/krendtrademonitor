@@ -54,6 +54,7 @@ BotView::BotView(QWidget* parent, ApiClient* api_, BotLink* bot_)
     , isReplanInFlight(false)
     , isWaitingForPlan(false)
     , status(nullptr)
+    , botBudget(nullptr)
     , showPlans(nullptr)
     , showEvents(nullptr)
     , showNotify(nullptr)
@@ -71,6 +72,9 @@ bool BotView::InitForChild()
     status = new QLabel(this);
     status->setWordWrap(true);
     status->setTextInteractionFlags(Qt::TextSelectableByMouse);
+
+    botBudget = new QLabel("Бюджет бота: —", this);
+    botBudget->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
     showPlans  = new QCheckBox("планы", this);
     showEvents = new QCheckBox("события", this);
@@ -130,6 +134,7 @@ bool BotView::SetupUIForChild(QGridLayout* mainLayout)
 {
     mainLayout->setContentsMargins(6, 6, 6, 6);
     mainLayout->addWidget(status, 0, 0);
+    mainLayout->addWidget(botBudget, 1, 0);
 
     auto* filters = new QHBoxLayout();
     filters->addWidget(new QLabel("Показывать:", this));
@@ -137,16 +142,16 @@ bool BotView::SetupUIForChild(QGridLayout* mainLayout)
     filters->addWidget(showEvents);
     filters->addWidget(showNotify);
     filters->addStretch(1);
-    mainLayout->addLayout(filters, 1, 0);
+    mainLayout->addLayout(filters, 2, 0);
 
-    mainLayout->addWidget(feed, 2, 0);
-    mainLayout->setRowStretch(2, 1);
+    mainLayout->addWidget(feed, 3, 0);
+    mainLayout->setRowStretch(3, 1);
 
     auto* bottom = new QHBoxLayout();
     bottom->addWidget(comment, 1);
     bottom->addWidget(replanButton);
-    mainLayout->addLayout(bottom, 3, 0);
-    mainLayout->addWidget(replanStatus, 4, 0);
+    mainLayout->addLayout(bottom, 4, 0);
+    mainLayout->addWidget(replanStatus, 5, 0);
     UpdateStatus();
     return true;
 }
@@ -157,6 +162,11 @@ bool BotView::ApplyStyleForChild(const Theme& theme)
     cText = c.text.name(); cMuted = c.mutedText.name(); cGood = c.good.name(); cBad = c.bad.name();
     cWarning = c.warning.name(); cAccent = c.accent.name(); cBorder = c.border.name(); cAltBase = c.alternateBase.name();
     replanButton->setStyleSheet(QString("QPushButton { font-weight: bold; padding: 4px 14px; }"));
+    QFont budgetFont = botBudget->font();
+    budgetFont.setPointSizeF(budgetFont.pointSizeF() + 2.0);
+    budgetFont.setBold(true);
+    botBudget->setFont(budgetFont);
+    botBudget->setStyleSheet(QString("QLabel { color: %1; }").arg(c.good.name()));
     UpdateStatus();
     Render();
     return true;
@@ -358,13 +368,11 @@ void BotView::UpdateStatus()
             parts << "без позиции";
         }
 
-        const QJsonObject budget = s.value("budget").toObject();
-        if(!budget.isEmpty()) {
-            const double eq = budget.value("equity").toDouble();
-            const double b = budget.value("budget_usd").toDouble();
-            parts << QString("бюджет <b style='color:%1'>%2 $</b> из %3 $").arg(eq >= b ? cGood : cBad)
-                         .arg(eq, 0, 'f', 2).arg(b, 0, 'f', 0);
-        }
+        const QJsonValue budget = s.value("account_equity");
+        if (budget.isDouble())
+            botBudget->setText(QString("Бюджет бота: %1 $").arg(budget.toDouble(), 0, 'f', 2));
+        else
+            botBudget->setText("Бюджет бота: —");
         parts << QString("сделок сегодня: %1").arg(s.value("trades_today").toInt());
         const QString botAcc = s.value("bot_account").toString();
         const QString opAcc = s.value("operator_account").toString();
@@ -373,6 +381,7 @@ void BotView::UpdateStatus()
                          .arg(cMuted, Esc(botAcc), Esc(opAcc.isEmpty() ? QString("—") : opAcc));
         status->setText(parts.join(" · "));
     }
+    if(s.isEmpty()) botBudget->setText("Бюджет бота: —");
 
     const bool planning = bot->IsPlanning();
     replanButton->setEnabled(!planning && !isReplanInFlight);
